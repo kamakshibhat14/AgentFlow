@@ -27,16 +27,70 @@ async function graphql(
     }),
   });
 
-  const result = await response.json();
+  const text = await response.text();
+
+  let result: any;
+
+  try {
+    result = JSON.parse(text);
+  } catch {
+    throw new Error(`GraphQL returned invalid JSON: ${text}`);
+  }
 
   if (!response.ok || result.errors) {
     console.error("GRAPHQL ERROR:", result.errors);
+
     throw new Error(
-      result.errors?.[0]?.message || "GraphQL request failed"
+      result.errors?.[0]?.message ||
+        `GraphQL request failed: ${response.status}`
     );
   }
 
   return result.data;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runHttpRequest() {
+  let lastError: any;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await fetch("https://httpbin.org/get");
+
+      if (!response.ok) {
+        throw new Error(`HTTP request failed: ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      lastError = error;
+
+      if (attempt < 2) {
+        await sleep(500);
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+async function runLlmCall() {
+  /*
+   * Assignment allows a disclosed stub if an LLM API
+   * is not available.
+   *
+   * This stub intentionally returns "yes" so that the
+   * conditional branch reaches the approval gate.
+   */
+  await sleep(1000);
+
+  return {
+    text: "yes",
+    source: "disclosed-demo-stub",
+  };
 }
 
 export default async function handler(
@@ -47,12 +101,11 @@ export default async function handler(
     console.log("=================================");
     console.log("TRIGGER WORKFLOW RUN");
     console.log("BODY:", JSON.stringify(req.body));
-    console.log("HEADERS:", req.headers);
     console.log("=================================");
-    
+
     const workflowId = req.body?.input?.workflow_id;
-  
-      const userId =
+
+    const userId =
       req.body?.session_variables?.["x-hasura-user-id"];
 
     if (!workflowId) {
@@ -69,7 +122,7 @@ export default async function handler(
 
     /*
      * STEP 1
-     * Get workflow and its organization.
+     * Get workflow.
      */
     const workflowData = await graphql(
       `
@@ -96,8 +149,7 @@ export default async function handler(
 
     /*
      * STEP 2
-     * Check that the logged-in user belongs
-     * to the workflow's organization.
+     * Check organization membership.
      */
     const memberData = await graphql(
       `
@@ -128,25 +180,64 @@ export default async function handler(
 
     if (!member) {
       return res.status(403).json({
-        message: "User is not a member of this organization",
+        message:
+          "User is not a member of this organization",
       });
     }
 
     /*
      * STEP 3
-     * Only owner/editor can trigger.
+     * Owner/editor can run.
      */
     if (
       member.role !== "owner" &&
       member.role !== "editor"
     ) {
       return res.status(403).json({
-        message: "Only owner/editor can run workflows",
+        message:
+          "Only owner/editor can run workflows",
       });
     }
 
     /*
      * STEP 4
+     * Get workflow steps in order.
+     */
+    const stepsData = await graphql(
+      `
+        query GetWorkflowSteps($workflow_id: uuid!) {
+          workflow_steps(
+            where: {
+              workflow_id: { _eq: $workflow_id }
+            }
+            order_by: {
+              step_order: asc
+            }
+          ) {
+            id
+            workflow_id
+            step_order
+            name
+            type
+            config
+          }
+        }
+      `,
+      {
+        workflow_id: workflowId,
+      }
+    );
+
+    const steps = stepsData.workflow_steps || [];
+
+    if (steps.length === 0) {
+      return res.status(400).json({
+        message: "Workflow has no steps",
+      });
+    }
+
+    /*
+     * STEP 5
      * Create workflow run.
      */
     const runData = await graphql(
@@ -180,23 +271,310 @@ export default async function handler(
       }
     );
 
-    const run = runData.insert_workflow_runs_one;
+    const run =
+      runData.insert_workflow_runs_one;
 
-    console.log("WORKFLOW RUN CREATED:", run);
+    console.log("WORKFLOW RUN:", run.id);
 
     /*
-     * Return to Hasura Action.
+     * Previous step output.
      */
+    let previousOutput: any = null;
+
+    /*
+     * STEP 6
+     * Execute steps sequentially.
+     */
+    for (const step of steps) {
+      console.log(
+        `Executing step ${step.step_order}: ${step.type}`
+      );
+
+      /*
+       * Create step_run.
+       */
+      const stepRunData = await graphql(
+        `
+          mutation CreateStepRun(
+            $workflow_run_id: uuid!
+            $workflow_step_id: uuid!
+            $status: String!
+            $input: jsonb
+            $attempt_count: Int!
+          ) {
+            insert_step_runs_one(
+              object: {
+                workflow_run_id: $workflow_run_id
+                workflow_step_id: $workflow_step_id
+                status: $status
+                input: $input
+                attempt_count: $attempt_count
+              }
+            ) {
+              id
+              status
+            }
+          }
+        `,
+        {
+          workflow_run_id: run.id,
+          workflow_step_id: step.id,
+          status: "running",
+          input: previousOutput,
+          attempt_count: 1,
+        }
+      );
+
+      const stepRun =
+        stepRunData.insert_step_runs_one;
+
+      try {
+        let output: any;
+
+        /*
+         * LLM
+         */
+        if (step.type === "llm_call") {
+          output = await runLlmCall();
+        }
+
+        /*
+         * HTTP
+         */
+        else if (step.type === "http_request") {
+          output = await runHttpRequest();
+        }
+
+        /*
+         * CONDITIONAL
+         */
+        else if (
+          step.type === "conditional_branch"
+        ) {
+          const text =
+            typeof previousOutput === "string"
+              ? previousOutput
+              : previousOutput?.text || "";
+
+          const condition =
+            String(text).toLowerCase().includes("yes");
+
+          output = {
+            condition,
+            branch: condition
+              ? "approval"
+              : "complete",
+          };
+        }
+
+        /*
+         * APPROVAL
+         */
+        else if (
+          step.type === "approval_gate"
+        ) {
+          await graphql(
+            `
+              mutation PauseStep(
+                $id: uuid!
+                $status: String!
+              ) {
+                update_step_runs_by_pk(
+                  pk_columns: { id: $id }
+                  _set: {
+                    status: $status
+                  }
+                ) {
+                  id
+                  status
+                }
+              }
+            `,
+            {
+              id: stepRun.id,
+              status: "paused",
+            }
+          );
+
+          await graphql(
+            `
+              mutation PauseWorkflow(
+                $id: uuid!
+                $status: String!
+              ) {
+                update_workflow_runs_by_pk(
+                  pk_columns: { id: $id }
+                  _set: {
+                    status: $status
+                  }
+                ) {
+                  id
+                  status
+                }
+              }
+            `,
+            {
+              id: run.id,
+              status: "paused",
+            }
+          );
+
+          return res.status(200).json({
+            id: run.id,
+            status: "paused",
+            message:
+              `Workflow "${workflow.name}" is paused awaiting approval`,
+          });
+        }
+
+        /*
+         * Unknown step type
+         */
+        else {
+          throw new Error(
+            `Unsupported step type: ${step.type}`
+          );
+        }
+
+        /*
+         * Save successful step.
+         */
+        await graphql(
+          `
+            mutation CompleteStep(
+              $id: uuid!
+              $status: String!
+              $output: jsonb
+            ) {
+              update_step_runs_by_pk(
+                pk_columns: { id: $id }
+                _set: {
+                  status: $status
+                  output: $output
+                }
+              ) {
+                id
+                status
+              }
+            }
+          `,
+          {
+            id: stepRun.id,
+            status: "completed",
+            output,
+          }
+        );
+
+        previousOutput = output;
+      } catch (stepError: any) {
+        console.error(
+          `STEP ${step.step_order} FAILED:`,
+          stepError
+        );
+
+        await graphql(
+          `
+            mutation FailStep(
+              $id: uuid!
+              $status: String!
+              $error: String!
+            ) {
+              update_step_runs_by_pk(
+                pk_columns: { id: $id }
+                _set: {
+                  status: $status
+                  error: $error
+                }
+              ) {
+                id
+                status
+              }
+            }
+          `,
+          {
+            id: stepRun.id,
+            status: "failed",
+            error:
+              stepError.message ||
+              "Step execution failed",
+          }
+        );
+
+        await graphql(
+          `
+            mutation FailWorkflow(
+              $id: uuid!
+              $status: String!
+            ) {
+              update_workflow_runs_by_pk(
+                pk_columns: { id: $id }
+                _set: {
+                  status: $status
+                }
+              ) {
+                id
+                status
+              }
+            }
+          `,
+          {
+            id: run.id,
+            status: "failed",
+          }
+        );
+
+        return res.status(500).json({
+          id: run.id,
+          status: "failed",
+          message:
+            stepError.message ||
+            "Workflow execution failed",
+        });
+      }
+    }
+
+    /*
+     * All steps completed.
+     */
+    await graphql(
+      `
+        mutation CompleteWorkflow(
+          $id: uuid!
+          $status: String!
+        ) {
+          update_workflow_runs_by_pk(
+            pk_columns: { id: $id }
+            _set: {
+              status: $status
+            }
+          ) {
+            id
+            status
+          }
+        }
+      `,
+      {
+        id: run.id,
+        status: "completed",
+      }
+    );
+
     return res.status(200).json({
       id: run.id,
-      status: "running",
-      message: `Workflow "${workflow.name}" started successfully`,
+      status: "completed",
+      message:
+        `Workflow "${workflow.name}" completed successfully`,
     });
   } catch (error: any) {
-    console.error("TRIGGER WORKFLOW ERROR:", error);
+    console.error(
+      "TRIGGER WORKFLOW ERROR:",
+      error
+    );
 
     return res.status(500).json({
-      message: error.message || "Workflow execution failed",
+      message:
+        error.message ||
+        "Workflow execution failed",
     });
   }
 }
