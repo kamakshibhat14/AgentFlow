@@ -50,8 +50,7 @@ export default async function handler(
     console.log("HEADERS:", req.headers);
     console.log("=================================");
 
-    const workflowId = req.body?.input?.workflow_id;
-
+    const { workflow_id } = req.body || {};
     const userId =
       req.body?.session_variables?.["x-hasura-user-id"];
 
