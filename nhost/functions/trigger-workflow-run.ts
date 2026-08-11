@@ -367,6 +367,55 @@ export default async function handler(
           };
         }
 
+    /*
+     * DB WRITE
+     */
+    else if (step.type === "db_write") {
+      const resultKey =
+        step.config?.result_key ||
+        step.name ||
+        "workflow_result";
+
+      await graphql(
+        `
+          mutation SaveWorkflowResult(
+            $org_id: uuid!
+            $workflow_id: uuid!
+            $workflow_run_id: uuid!
+            $result_key: String!
+            $result_value: jsonb!
+          ) {
+            insert_workflow_results_one(
+              object: {
+                org_id: $org_id
+                workflow_id: $workflow_id
+                workflow_run_id: $workflow_run_id
+                result_key: $result_key
+                result_value: $result_value
+              }
+            ) {
+              id
+              result_key
+              result_value
+            }
+          }
+        `,
+        {
+          org_id: workflow.org_id,
+          workflow_id: workflow.id,
+          workflow_run_id: run.id,
+          result_key: resultKey,
+          result_value: previousOutput,
+        }
+      );
+
+      output = {
+        saved: true,
+        result_key: resultKey,
+        result_value: previousOutput,
+      };
+    }
+
         /*
          * APPROVAL
          */
