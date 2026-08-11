@@ -3,9 +3,11 @@ import { Request, Response } from "express";
 const GRAPHQL_URL = process.env.NHOST_GRAPHQL_URL;
 const ADMIN_SECRET = process.env.NHOST_ADMIN_SECRET;
 
+type Variables = Record<string, any>;
+
 async function graphql(
   query: string,
-  variables: Record<string, any>
+  variables: Variables
 ) {
   if (!GRAPHQL_URL) {
     throw new Error("NHOST_GRAPHQL_URL is missing");
@@ -19,12 +21,12 @@ async function graphql(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-hasura-admin-secret": ADMIN_SECRET,
+      "x-hasura-admin-secret": ADMIN_SECRET
     },
     body: JSON.stringify({
       query,
-      variables,
-    }),
+      variables
+    })
   });
 
   const text = await response.text();
@@ -38,11 +40,9 @@ async function graphql(
   }
 
   if (!response.ok || result.errors) {
-    console.error("GRAPHQL ERROR:", result.errors);
-
     throw new Error(
       result.errors?.[0]?.message ||
-      "GraphQL request failed"
+        "GraphQL request failed"
     );
   }
 
@@ -54,10 +54,8 @@ export default async function handler(
   res: Response
 ) {
   try {
-    console.log("=================================");
-    console.log("APPROVE STEP");
+    console.log("========== APPROVE STEP ==========");
     console.log("BODY:", JSON.stringify(req.body));
-    console.log("=================================");
 
     const stepRunId =
       req.body?.input?.step_run_id;
@@ -67,41 +65,38 @@ export default async function handler(
         "x-hasura-user-id"
       ];
 
-    /*
-     * 1. Validate input
-     */
     if (!stepRunId) {
       return res.status(400).json({
-        id: "",
-        status: "error",
-        message: "step_run_id is required",
+        id: stepRunId ?? "",
+        status: "failed",
+        message: "step_run_id is required"
       });
     }
 
     if (!userId) {
       return res.status(401).json({
         id: stepRunId,
-        status: "error",
-        message: "Authenticated user is required",
+        status: "failed",
+        message: "Authenticated user is required"
       });
     }
 
     /*
-     * 2. Find the step run
+     * 1. Find the step run
      */
     const stepRunData = await graphql(
       `
         query GetStepRun($id: uuid!) {
           step_runs_by_pk(id: $id) {
             id
+            status
             workflow_run_id
             workflow_step_id
-            status
           }
         }
       `,
       {
-        id: stepRunId,
+        id: stepRunId
       }
     );
 
@@ -111,25 +106,25 @@ export default async function handler(
     if (!stepRun) {
       return res.status(404).json({
         id: stepRunId,
-        status: "error",
-        message: "Step run not found",
+        status: "failed",
+        message: "Step run not found"
       });
     }
 
     /*
-     * 3. Step must currently be paused
+     * 2. It must currently be paused
      */
     if (stepRun.status !== "paused") {
       return res.status(400).json({
         id: stepRunId,
         status: stepRun.status,
         message:
-          `Step is not awaiting approval. Current status: ${stepRun.status}`,
+          "This step is not waiting for approval"
       });
     }
 
     /*
-     * 4. Find workflow run
+     * 3. Get workflow run
      */
     const runData = await graphql(
       `
@@ -142,23 +137,23 @@ export default async function handler(
         }
       `,
       {
-        id: stepRun.workflow_run_id,
+        id: stepRun.workflow_run_id
       }
     );
 
-    const run =
+    const workflowRun =
       runData.workflow_runs_by_pk;
 
-    if (!run) {
+    if (!workflowRun) {
       return res.status(404).json({
         id: stepRunId,
-        status: "error",
-        message: "Workflow run not found",
+        status: "failed",
+        message: "Workflow run not found"
       });
     }
 
     /*
-     * 5. Find workflow and organization
+     * 4. Get workflow organization
      */
     const workflowData = await graphql(
       `
@@ -171,7 +166,7 @@ export default async function handler(
         }
       `,
       {
-        id: run.workflow_id,
+        id: workflowRun.workflow_id
       }
     );
 
@@ -181,13 +176,13 @@ export default async function handler(
     if (!workflow) {
       return res.status(404).json({
         id: stepRunId,
-        status: "error",
-        message: "Workflow not found",
+        status: "failed",
+        message: "Workflow not found"
       });
     }
 
     /*
-     * 6. Check organization membership
+     * 5. Check organization membership
      */
     const memberData = await graphql(
       `
@@ -210,7 +205,7 @@ export default async function handler(
       `,
       {
         user_id: userId,
-        org_id: workflow.org_id,
+        org_id: workflow.org_id
       }
     );
 
@@ -220,14 +215,14 @@ export default async function handler(
     if (!member) {
       return res.status(403).json({
         id: stepRunId,
-        status: "error",
+        status: "failed",
         message:
-          "You are not a member of this organization",
+          "You are not a member of this organization"
       });
     }
 
     /*
-     * 7. Only owner/editor can approve
+     * 6. Approval requires owner OR editor
      */
     if (
       member.role !== "owner" &&
@@ -235,19 +230,19 @@ export default async function handler(
     ) {
       return res.status(403).json({
         id: stepRunId,
-        status: "error",
+        status: "failed",
         message:
-          "Only owner/editor can approve this step",
+          "Only owner/editor can approve this step"
       });
     }
 
     /*
-     * 8. Approve the paused step
+     * 7. Approve the step
      */
     const approvedAt =
       new Date().toISOString();
 
-    const stepUpdateData = await graphql(
+    const updateData = await graphql(
       `
         mutation ApproveStep(
           $id: uuid!
@@ -255,7 +250,9 @@ export default async function handler(
           $approved_at: timestamptz!
         ) {
           update_step_runs_by_pk(
-            pk_columns: { id: $id }
+            pk_columns: {
+              id: $id
+            }
             _set: {
               status: "completed"
               approved_by: $approved_by
@@ -272,83 +269,88 @@ export default async function handler(
       {
         id: stepRunId,
         approved_by: userId,
-        approved_at: approvedAt,
+        approved_at: approvedAt
       }
     );
 
-    const updatedStep =
-      stepUpdateData.update_step_runs_by_pk;
+    const updated =
+      updateData.update_step_runs_by_pk;
 
-    if (!updatedStep) {
-      return res.status(404).json({
+    if (!updated) {
+      return res.status(500).json({
         id: stepRunId,
-        status: "error",
-        message: "Could not update step run",
+        status: "failed",
+        message:
+          "Failed to update approval step"
       });
     }
 
     /*
-     * 9. Resume workflow
+     * 8. Resume the workflow.
      *
-     * Our current Test Workflow has the
-     * approval gate as its final step.
-     * Therefore approval completes the run.
+     * For the current demo workflow,
+     * approval is the final step.
      */
-    const workflowUpdateData = await graphql(
-      `
-        mutation CompleteWorkflowRun(
-          $id: uuid!
-        ) {
-          update_workflow_runs_by_pk(
-            pk_columns: { id: $id }
-            _set: {
-              status: "completed"
-            }
+    const workflowUpdate =
+      await graphql(
+        `
+          mutation ResumeWorkflow(
+            $id: uuid!
           ) {
-            id
-            status
+            update_workflow_runs_by_pk(
+              pk_columns: {
+                id: $id
+              }
+              _set: {
+                status: "completed"
+              }
+            ) {
+              id
+              status
+            }
           }
+        `,
+        {
+          id: workflowRun.id
         }
-      `,
-      {
-        id: run.id,
-      }
-    );
+      );
 
-    const updatedRun =
-      workflowUpdateData.update_workflow_runs_by_pk;
+    const resumed =
+      workflowUpdate.update_workflow_runs_by_pk;
 
-    if (!updatedRun) {
-      return res.status(404).json({
+    if (!resumed) {
+      return res.status(500).json({
         id: stepRunId,
-        status: "error",
-        message: "Could not resume workflow run",
+        status: "failed",
+        message:
+          "Step approved but workflow could not be resumed"
       });
     }
 
-    /*
-     * 10. Success
-     */
-    console.log("APPROVAL SUCCESS");
-    console.log("STEP:", updatedStep);
-    console.log("RUN:", updatedRun);
+    console.log(
+      "Approval successful:",
+      stepRunId
+    );
 
     return res.status(200).json({
       id: stepRunId,
       status: "completed",
       message:
-        `Approval successful. Workflow "${workflow.name}" completed successfully`,
+        "Approval successful. Workflow resumed and completed."
     });
 
   } catch (error: any) {
-    console.error("APPROVE STEP ERROR:", error);
+    console.error(
+      "APPROVE STEP ERROR:",
+      error
+    );
 
     return res.status(500).json({
-      id:
-        req.body?.input?.step_run_id || "",
-      status: "error",
+      id: "",
+      status: "failed",
       message:
-        error?.message || "Approval failed",
+        error?.message ||
+        "Internal server error"
     });
   }
 }
