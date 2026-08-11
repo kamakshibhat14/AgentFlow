@@ -58,7 +58,7 @@ async function runHttpRequest() {
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const response = await fetch("https://httpbin.org/get");
+      const response = await fetch("https://jsonplaceholder.typicode.com/todos/1");
 
       if (!response.ok) {
         throw new Error(`HTTP request failed: ${response.status}`);
